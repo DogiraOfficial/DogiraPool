@@ -257,7 +257,7 @@ contract DogiraPool is Ownable, Initializable, ReentrancyGuard {
                     } else {
                         safeTransferReward(msg.sender, pending);
                     }
-                } else if (currentRewardBalance > 0) {
+                } else {
                     user.lockedDebt = user.lockedDebt + pending;
                 }
             }
