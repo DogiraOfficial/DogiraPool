@@ -36,21 +36,21 @@ pragma solidity ^0.8.4;
 import "SafeERC20.sol";
 import "Ownable.sol";
 import "Initializable.sol";
+import "ReentrancyGuard.sol";
 
-contract DogiraPool is Ownable, Initializable {
+contract DogiraPool is Ownable, Initializable, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
     // Info of each user.
     struct UserInfo {
         uint256 amount;             // How many tokens the user has provided.
         uint256 blockStaked;        // What block the user staked in on.
-        uint256 rewardDebt;         // Reward debt. See explanation below.
+        uint256 rewardDebt;         // Reward debt, tokens staked out to user
+        uint256 lockedDebt;         // Locked debt, reward tokens owed to user but awaiting lockup time to pass.
     }
 
     // Info of each pool.
     struct PoolInfo {
-        IERC20 lpToken;           // Address of LP token contract.
-        uint256 allocPoint;       // How many allocation points assigned to this pool. Rewards to distribute per block.
         uint256 firstRewardBlock;  // First block number that Rewards distribution occurs.
         uint256 accRewardTokenPerShare; // Accumulated Rewards per share, times 1e30. See below.
     }
@@ -126,6 +126,7 @@ contract DogiraPool is Ownable, Initializable {
     event EarlyWithdrawalBlocksSet(uint256 earlyWithdrawalBlocks);
     event FeeTaken(address indexed feeAddress, uint256 tokensTransferred);
     event RewardsWithdrawalRequested(uint256 unlockBlock);
+    event FeeAddressUpdated(address indexed feeAddress);
     event RewardsWithdrawn();
     event DepositsEnabled();
 
@@ -144,7 +145,7 @@ contract DogiraPool is Ownable, Initializable {
         bool _depositsEnabled,
         bool _blockSmartContracts,
         address payable _feeAddress
-    ) external initializer
+    ) external initializer onlyOwner
     {
         STAKE_TOKEN = _stakeToken;
         REWARD_TOKEN = _rewardToken;
@@ -157,13 +158,9 @@ contract DogiraPool is Ownable, Initializable {
 
         // staking pool
         poolInfo = PoolInfo({
-        lpToken: _stakeToken,
-        allocPoint: 1000,
         firstRewardBlock: startBlock,
         accRewardTokenPerShare: 0
         });
-
-        totalAllocPoint = 1000;
     }
 
     /// Return reward multiplier over the given _from to _to block.
@@ -184,6 +181,9 @@ contract DogiraPool is Ownable, Initializable {
     /// @return True if minimum staking period has passed, otherwise false
     function canWithdrawWithoutLockup(uint256 _stakedInBlock) public view returns(bool) {
         uint256 noPenaltyBlock = harvestLockupBlocks + _stakedInBlock;
+        if (noPenaltyBlock > endBlock) {
+            noPenaltyBlock = endBlock;
+        }
         if (block.number > noPenaltyBlock) {
             return true;
         }
@@ -209,7 +209,7 @@ contract DogiraPool is Ownable, Initializable {
         uint256 accRewardTokenPerShare = poolInfo.accRewardTokenPerShare;
         if (block.number > poolInfo.firstRewardBlock && totalStaked != 0) {
             uint256 multiplier = getMultiplier(poolInfo.firstRewardBlock, block.number);
-            uint256 tokenReward = multiplier * rewardPerBlock * poolInfo.allocPoint / totalAllocPoint;
+            uint256 tokenReward = multiplier * rewardPerBlock;
             accRewardTokenPerShare = accRewardTokenPerShare + (tokenReward * 1e30 / totalStaked);
         }
         return user.amount * accRewardTokenPerShare / 1e30 - user.rewardDebt;
@@ -225,7 +225,7 @@ contract DogiraPool is Ownable, Initializable {
             return;
         }
         uint256 multiplier = getMultiplier(poolInfo.firstRewardBlock, block.number);
-        uint256 tokenReward = multiplier * rewardPerBlock * poolInfo.allocPoint / totalAllocPoint;
+        uint256 tokenReward = multiplier * rewardPerBlock;
         poolInfo.accRewardTokenPerShare = poolInfo.accRewardTokenPerShare + (tokenReward * 1e30 / totalStaked);
         poolInfo.firstRewardBlock = block.number;
     }
@@ -235,7 +235,7 @@ contract DogiraPool is Ownable, Initializable {
     /// @dev Since this contract needs to be supplied with rewards we are
     ///  sending the balance of the contract if the pending rewards are higher
     /// @param _amount The amount of staking tokens to deposit
-    function deposit(uint256 _amount) public {
+    function deposit(uint256 _amount) public nonReentrant {
         require(depositsEnabled, 'Deposits have not yet been enabled.');
         if (blockSmartContracts) {
             require(msg.sender == tx.origin, "Smart Contracts cannot interact with this pool.");
@@ -248,11 +248,17 @@ contract DogiraPool is Ownable, Initializable {
             if(pending > 0) {
                 uint256 currentRewardBalance = rewardBalance();
                 if(currentRewardBalance > 0 && canWithdrawWithoutLockup(user.blockStaked)) {
-                    if(pending > currentRewardBalance) {
-                        safeTransferReward(address(msg.sender), currentRewardBalance);
-                    } else {
-                        safeTransferReward(address(msg.sender), pending);
+                    if (user.lockedDebt > 0) {
+                        pending = pending + user.lockedDebt;
+                        user.lockedDebt = 0;
                     }
+                    if(pending > currentRewardBalance) {
+                        safeTransferReward(msg.sender, currentRewardBalance);
+                    } else {
+                        safeTransferReward(msg.sender, pending);
+                    }
+                } else if (currentRewardBalance > 0) {
+                    user.lockedDebt = user.lockedDebt + pending;
                 }
             }
         }
@@ -260,11 +266,11 @@ contract DogiraPool is Ownable, Initializable {
             uint256 preStakeBalance = STAKE_TOKEN.balanceOf(address(this));
             if (depositFee > 0) {
                 uint256 _depositFee = _amount * depositFee / 10000;
-                poolInfo.lpToken.safeTransferFrom(address(msg.sender), address(feeAddress), _depositFee);
+                STAKE_TOKEN.safeTransferFrom(msg.sender, address(feeAddress), _depositFee);
                 _amount = _amount - _depositFee;
                 emit FeeTaken(feeAddress, _depositFee);
             }
-            poolInfo.lpToken.safeTransferFrom(address(msg.sender), address(this), _amount);
+            STAKE_TOKEN.safeTransferFrom(msg.sender, address(this), _amount);
             finalDepositAmount = STAKE_TOKEN.balanceOf(address(this)) - preStakeBalance;
             user.blockStaked = block.number;
             user.amount = user.amount + finalDepositAmount;
@@ -277,7 +283,7 @@ contract DogiraPool is Ownable, Initializable {
 
     /// Withdraw rewards and/or staked tokens. Pass a 0 amount to withdraw only rewards
     /// @param _amount The amount of staking tokens to withdraw
-    function withdraw(uint256 _amount) public {
+    function withdraw(uint256 _amount) public nonReentrant {
         UserInfo storage user = userInfo[msg.sender];
         require(user.amount >= _amount, "Error: insufficient output amount");
         require(canWithdrawWithoutLockup(user.blockStaked), "The minimum timespan for withdrawals has not yet passed.");
@@ -287,22 +293,23 @@ contract DogiraPool is Ownable, Initializable {
             uint256 currentRewardBalance = rewardBalance();
             if(currentRewardBalance > 0) {
                 if(pending > currentRewardBalance) {
-                    safeTransferReward(address(msg.sender), currentRewardBalance);
+                    safeTransferReward(msg.sender, currentRewardBalance);
                 } else {
-                    safeTransferReward(address(msg.sender), pending);
+                    safeTransferReward(msg.sender, pending);
                 }
             }
         }
         if(_amount > 0) {
+            totalStaked -= _amount;
+            user.amount -= _amount;
             if (earlyWithdrawalFee > 0 && !canWithdrawWithoutPenalty(user.blockStaked)) {
                 uint256 withdrawalFee = _amount * earlyWithdrawalFee / 10000;
-                poolInfo.lpToken.safeTransfer(address(feeAddress), withdrawalFee);
+                STAKE_TOKEN.safeTransfer(address(feeAddress), withdrawalFee);
                 _amount = _amount - withdrawalFee;
                 emit FeeTaken(feeAddress, withdrawalFee);
             }
-            user.amount = user.amount - _amount;
-            poolInfo.lpToken.safeTransfer(address(msg.sender), _amount);
-            totalStaked = totalStaked - _amount;
+
+            STAKE_TOKEN.safeTransfer(msg.sender, _amount);
         }
 
         user.rewardDebt = user.amount * poolInfo.accRewardTokenPerShare / 1e30;
@@ -323,7 +330,7 @@ contract DogiraPool is Ownable, Initializable {
     /// @param _amount Amount of tokens to deposit
     function depositRewards(uint256 _amount) external {
         require(_amount > 0, 'Deposit value must be greater than 0.');
-        REWARD_TOKEN.safeTransferFrom(address(msg.sender), address(this), _amount);
+        REWARD_TOKEN.safeTransferFrom(msg.sender, address(this), _amount);
         emit DepositRewards(_amount);
     }
 
@@ -355,6 +362,7 @@ contract DogiraPool is Ownable, Initializable {
 
     /// @dev Remove excess stake tokens earned by reflect fees
     function skimStakeTokenFees() external onlyOwner {
+        require(address(REWARD_TOKEN) != address(STAKE_TOKEN), "Cannot skim same-token pairs!");
         uint256 stakeTokenFeeBalance = getStakeTokenFeeBalance();
         STAKE_TOKEN.safeTransfer(msg.sender, stakeTokenFeeBalance);
         emit SkimStakeTokenFees(msg.sender, stakeTokenFeeBalance);
@@ -391,6 +399,7 @@ contract DogiraPool is Ownable, Initializable {
     /// @param _earlyWithdrawalBlocks Amount of blocks that must pass before a user can un-stake without penalty
     function setEarlyWithdrawalBlocks(uint256 _earlyWithdrawalBlocks) external onlyOwner beforeStart {
         require (_earlyWithdrawalBlocks <= maxEarlyWithdrawalBlocks, 'Cannot exceed max early withdrawal blocks!');
+        require(_earlyWithdrawalBlocks > harvestLockupBlocks, 'earlyWithdrawalBlocks must be greater than harvestLockupBlocks!');
         earlyWithdrawalBlocks = _earlyWithdrawalBlocks;
         emit EarlyWithdrawalFeeSet(earlyWithdrawalFee);
     }
@@ -398,6 +407,9 @@ contract DogiraPool is Ownable, Initializable {
     /// @param _harvestLockupBlocks Amount of blocks that must pass before a user can un-stake
     function setHarvestLockupBlocks(uint256 _harvestLockupBlocks) external onlyOwner beforeStart {
         require(_harvestLockupBlocks <= maxHarvestLockupBlocks, 'Cannot exceed max harvest lockup blocks!');
+        if (earlyWithdrawalFee > 0) {
+            require(_harvestLockupBlocks < earlyWithdrawalBlocks, 'harvestLockupBlocks must be less than earlyWithdrawalBlocks!');
+        }
         harvestLockupBlocks = _harvestLockupBlocks;
         emit HarvestLockupBlocksSet(harvestLockupBlocks);
     }
@@ -411,13 +423,21 @@ contract DogiraPool is Ownable, Initializable {
     /* Emergency Functions */
 
     // Withdraw without caring about rewards. EMERGENCY ONLY.
-    function emergencyWithdraw() external {
+    function emergencyWithdraw() external nonReentrant {
         UserInfo storage user = userInfo[msg.sender];
-        poolInfo.lpToken.safeTransfer(address(msg.sender), user.amount);
         totalStaked = totalStaked - user.amount;
+        uint256 _amount = user.amount;
+        if (earlyWithdrawalFee > 0 && !canWithdrawWithoutPenalty(user.blockStaked)) {
+            uint256 withdrawalFee = _amount * earlyWithdrawalFee / 10000;
+            _amount = _amount - withdrawalFee;
+            STAKE_TOKEN.safeTransfer(address(feeAddress), withdrawalFee);
+            emit FeeTaken(feeAddress, withdrawalFee);
+        }
         user.amount = 0;
         user.rewardDebt = 0;
-        emit EmergencyWithdraw(msg.sender, user.amount);
+        user.lockedDebt = 0;
+        STAKE_TOKEN.safeTransfer(msg.sender, _amount);
+        emit EmergencyWithdraw(msg.sender, _amount);
     }
 
     /// @dev Request removal of rewards balance, in the event a redeploy or otherwise is required.
@@ -443,9 +463,18 @@ contract DogiraPool is Ownable, Initializable {
         require(block.number > rewardsWithdrawalBlock, 'Not yet reached the rewards withdrawal block!');
         uint256 currentRewardBalance = rewardBalance();
         if(currentRewardBalance > 0) {
-            safeTransferReward(address(msg.sender), currentRewardBalance);
+            safeTransferReward(msg.sender, currentRewardBalance);
         }
+        rewardsWithdrawalRequested = false;
         emit RewardsWithdrawn();
+    }
+
+    /// @dev Update the fee address
+    /// @param _feeAddress non-zero payable address to receive fees
+    function updateFeeAddress(address payable _feeAddress) external onlyOwner {
+        require(_feeAddress != address(0), 'Fee address cannot be zero!');
+        feeAddress = _feeAddress;
+        emit FeeAddressUpdated(_feeAddress);
     }
 
     /// @notice A public function to sweep accidental BEP20 transfers to this contract.
@@ -455,7 +484,7 @@ contract DogiraPool is Ownable, Initializable {
         require(address(token) != address(STAKE_TOKEN), "Stake Token cannot be sweeped!");
         require(address(token) != address(REWARD_TOKEN), "Reward Token cannot be sweeped!");
         uint256 balance = token.balanceOf(address(this));
-        token.transfer(msg.sender, balance);
+        token.safeTransfer(msg.sender, balance);
         emit EmergencySweepWithdraw(msg.sender, token, balance);
     }
 
