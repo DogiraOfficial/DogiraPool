@@ -83,8 +83,8 @@ contract DogiraPool is Ownable, Initializable, ReentrancyGuard {
 
     // Minimum amount of blocks that must pass before a withdrawal is not considered "early"
     uint256 public earlyWithdrawalBlocks = 0;
-    // Max blocks for early withdrawal (default: 1 week on Polygon)
-    uint256 private maxEarlyWithdrawalBlocks = 300000;
+    // Max blocks for early withdrawal (default: 1 month on Polygon)
+    uint256 private maxEarlyWithdrawalBlocks = 1300000;
     // Fee for exiting early (if applicable)
     uint public earlyWithdrawalFee = 0;
     // Max fee for exiting early (default: 2%)
