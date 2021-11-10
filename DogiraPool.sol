@@ -289,6 +289,10 @@ contract DogiraPool is Ownable, Initializable, ReentrancyGuard {
         require(canWithdrawWithoutLockup(user.blockStaked), "The minimum timespan for withdrawals has not yet passed.");
         updatePool();
         uint256 pending = user.amount * poolInfo.accRewardTokenPerShare / 1e30 - user.rewardDebt;
+        if (user.lockedDebt > 0) {
+            pending = pending + user.lockedDebt;
+            user.lockedDebt = 0;
+        }
         if(pending > 0) {
             uint256 currentRewardBalance = rewardBalance();
             if(currentRewardBalance > 0) {
