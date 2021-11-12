@@ -3,6 +3,7 @@ pragma solidity ^0.8.4;
 
 /*
  * Dogira Staking/Rewards Pool v1.0
+ *
  * Website:         https://dogira.net
  * Staking Pools:   https://farm.dogira.net
  * Medium:          https://dogira-team.medium.com/
@@ -86,9 +87,12 @@ contract DogiraPool is Ownable, Initializable, ReentrancyGuard {
     // Max blocks for early withdrawal (default: 1 month on Polygon)
     uint256 private maxEarlyWithdrawalBlocks = 1300000;
     // Fee for exiting early (if applicable)
-    uint public earlyWithdrawalFee = 0;
-    // Max fee for exiting early (default: 2%)
-    uint private maxEarlyWithdrawalFee = 200;
+    uint256 public earlyWithdrawalFee = 0;
+    // Max fee for exiting early (default: 5%)
+    uint256 private maxEarlyWithdrawalFee = 500;
+
+    // Max total fee: early withdrawal + deposit combined (default: 6%)
+    uint256 public maxTotalFee = 600;
 
     // Info of each pool.
     PoolInfo public poolInfo;
@@ -180,6 +184,9 @@ contract DogiraPool is Ownable, Initializable, ReentrancyGuard {
     /// @param _stakedInBlock Block which the user staked in on
     /// @return True if minimum staking period has passed, otherwise false
     function canWithdrawWithoutLockup(uint256 _stakedInBlock) public view returns(bool) {
+        if (_stakedInBlock < startBlock) {
+            _stakedInBlock = startBlock; // Lockup time should only count from when emissions have begun.
+        }
         uint256 noPenaltyBlock = harvestLockupBlocks + _stakedInBlock;
         if (noPenaltyBlock > endBlock) {
             noPenaltyBlock = endBlock;
@@ -194,6 +201,9 @@ contract DogiraPool is Ownable, Initializable, ReentrancyGuard {
     /// @param _stakedInBlock Block which the user staked in on
     /// @return True if minimum staking period has passed, otherwise false
     function canWithdrawWithoutPenalty(uint256 _stakedInBlock) public view returns(bool) {
+        if (_stakedInBlock < startBlock) {
+            _stakedInBlock = startBlock; // Penalty time should only count from when emissions have begun.
+        }
         uint256 noPenaltyBlock = earlyWithdrawalBlocks + _stakedInBlock;
         if (block.number > noPenaltyBlock) {
             return true;
@@ -212,7 +222,7 @@ contract DogiraPool is Ownable, Initializable, ReentrancyGuard {
             uint256 tokenReward = multiplier * rewardPerBlock;
             accRewardTokenPerShare = accRewardTokenPerShare + (tokenReward * 1e30 / totalStaked);
         }
-        return user.amount * accRewardTokenPerShare / 1e30 - user.rewardDebt;
+        return (user.amount * accRewardTokenPerShare / 1e30 - user.rewardDebt) + user.lockedDebt;
     }
 
     /// Update reward variables of the given pool to be up-to-date.
@@ -276,6 +286,7 @@ contract DogiraPool is Ownable, Initializable, ReentrancyGuard {
             user.amount = user.amount + finalDepositAmount;
             totalStaked = totalStaked + finalDepositAmount;
         }
+
         user.rewardDebt = user.amount * poolInfo.accRewardTokenPerShare / 1e30;
 
         emit Deposit(msg.sender, finalDepositAmount);
@@ -389,6 +400,7 @@ contract DogiraPool is Ownable, Initializable, ReentrancyGuard {
     /// @param _depositFee Deposit fee for staked tokens, in hundredths of a percent
     function setDepositFee(uint256 _depositFee) external onlyOwner beforeStart {
         require(_depositFee <= maxDepositFee, 'Cannot exceed max deposit fee!');
+        require (earlyWithdrawalFee + _depositFee <= maxTotalFee, 'Cannot exceed max total fees!');
         depositFee = _depositFee;
         emit DepositFeeSet(depositFee);
     }
@@ -396,6 +408,7 @@ contract DogiraPool is Ownable, Initializable, ReentrancyGuard {
     /// @param _earlyWithdrawalFee Withdrawal fee for leaving staking early, in hundredths of a percent
     function setEarlyWithdrawalFee(uint256 _earlyWithdrawalFee) external onlyOwner beforeStart {
         require (_earlyWithdrawalFee <= maxEarlyWithdrawalFee, 'Cannot exceed max early withdrawal fee!');
+        require (_earlyWithdrawalFee + depositFee <= maxTotalFee, 'Cannot exceed max total fees!');
         earlyWithdrawalFee = _earlyWithdrawalFee;
         emit EarlyWithdrawalFeeSet(earlyWithdrawalFee);
     }
